@@ -58,37 +58,4 @@ Bem-vindo ao Monsters RPG! Um jogo de aventura baseado em texto onde você explo
 * **Menus de Seleção**: Teclas direcionais (Cima, Baixo) para selecionar e `Enter` para confirmar.
 * **Sair do Jogo**: `Ctrl + C`
 
-## Estrutura do Projeto (Simplificada)
-
-/
-├── src/                # Código fonte TypeScript
-│   ├── controller/     # Controladores (GameController, BattleController)
-│   ├── db/           # Lógica de banco de dados (Database.ts, db.json)
-│   ├── enum/         # Enumerações (PokemonType, BattleAction, ItemType)
-│   ├── model/        # Modelos de dados (Player, Pokemon, Map, Item, Inventory)
-│   ├── view/         # Telas e visualizações (GameView, BattleScreen, etc.)
-│   ├── tests/        # Testes unitários (opcional, mas recomendado)
-│   └── index.ts      # Ponto de entrada da aplicação
-├── dist/               # Código JavaScript compilado (gerado pelo tsc)
-│   ├── assets/
-│   │   └── map/
-│   │       └── mapa1.txt # Arquivo do mapa
-│   ├── controller/
-│   ├── db/
-│   ├── enum/
-│   ├── model/
-│   ├── view/
-│   └── index.js
-├── db.json             # Arquivo de save do jogo
-├── package.json
-├── tsconfig.json
-└── README.md           # Este arquivo
-
-
-## Para Desenvolvedores
-
-* O código fonte está em `src/` e é escrito em TypeScript.
-* O código compilado para JavaScript está em `dist/`.
-* Os testes podem ser executados com `npm test` (configurado em `package.json` e `jest.config.js`).
-
 Divirta-se jogando e explorando o código!
