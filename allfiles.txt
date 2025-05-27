@@ -1,0 +1,1942 @@
+//BattleController.ts
+
+import PlayerModel from '../model/Player';
+import Pokemon from '../model/Pokemon';
+import { BattleAction } from '../enum/BattleAction';
+import { PokemonType, TypeChart } from '../enum/PokemonType';
+import { ItemType, POTION, POKEBALL } from '../model/Item';
+import BattleScreen from '../view/BattleScreen';
+import GameController from './GameController';
+import Database from '../db/Database';
+
+export default class BattleController {
+  private player: PlayerModel;
+  private wildPokemon: Pokemon;
+  private battleScreen: BattleScreen;
+  private gameController: GameController;
+  private database: Database;
+  public onBattleEnd: () => void;
+
+  constructor(player: PlayerModel, wildPokemon: Pokemon, gameController: GameController, database: Database, onBattleEnd: () => void) {
+    this.player = player;
+    this.wildPokemon = wildPokemon;
+    this.gameController = gameController;
+    this.database = database;
+    this.onBattleEnd = onBattleEnd;
+
+    const activePlayerPokemon = this.player.getActivePokemon();
+    if (!activePlayerPokemon) {
+        console.error("Tentativa de iniciar batalha sem Pokémon ativo! Isso não deveria acontecer.");
+        this.onBattleEnd(); // Termina a batalha prematuramente se não houver pokémon.
+    }
+    this.battleScreen = new BattleScreen(player, wildPokemon, this);
+  }
+
+  public getScreen(): BattleScreen {
+    return this.battleScreen;
+  }
+
+  private calculateDamage(attacker: Pokemon, defender: Pokemon): number {
+    let damage = attacker.stats.attack - defender.stats.defense / 2;
+    if (damage < 1) damage = 1;
+
+    const attackerType = attacker.stats.type;
+    const defenderType = defender.stats.type;
+    let effectivenessMessage = "";
+
+    const typeInteraction = TypeChart[attackerType];
+    if (typeInteraction) {
+        if (typeInteraction.strongAgainst.includes(defenderType)) {
+            damage *= 2;
+            effectivenessMessage = ` É super efetivo!`;
+        } else if (typeInteraction.weakAgainst.includes(defenderType)) {
+            damage *= 0.5;
+            effectivenessMessage = ` Não é muito efetivo...`;
+        }
+    }
+    if (effectivenessMessage) {
+        this.battleScreen.message += effectivenessMessage;
+    }
+    return Math.floor(damage);
+  }
+
+  public handlePlayerAction(action: BattleAction, payload?: any): void {
+    let playerPokemon = this.player.getActivePokemon(); // Obtenha o pokémon ativo no início da ação
+    let playerActionMessage = ""; // Mensagem da ação do jogador
+    let enemyTurnShouldOccur = true;
+
+    // Verifica se o jogador tem um Pokémon para lutar
+    if (!playerPokemon || playerPokemon.currentHp === 0) {
+        const nextAvailablePokemon = this.player.team.find(p => p.currentHp > 0);
+        if (nextAvailablePokemon) {
+            this.battleScreen.message = "Seu Pokémon está caído! Você precisa trocar.";
+            // A tela de batalha deve permitir a seleção de um novo Pokémon.
+            // Por enquanto, apenas atualiza a mensagem e espera uma ação do tipo POKEMON.
+            // Idealmente, o BattleScreen entraria em modo de seleção de Pokémon.
+            this.battleScreen.updateBattleState(playerPokemon || this.player.team[0], this.wildPokemon, this.battleScreen.message); // Usa o primeiro da equipe se o ativo estiver caído.
+            this.battleScreen.render();
+            // Não deve retornar aqui se queremos que o jogador escolha um novo pokémon na mesma "rodada de input"
+            // Mas também não deve deixar o inimigo atacar se o jogador não puder agir.
+            // A lógica atual da BattleScreen pode já lidar com a seleção.
+            return; // Impede ações subsequentes e o turno do inimigo até que um novo Pokémon seja escolhido.
+        } else {
+            this.battleScreen.message = "Todos os seus Pokémon estão caídos!";
+            this.endBattle(false, false, false, this.battleScreen.message); // Derrota
+            return;
+        }
+    }
+
+    // Se chegamos aqui, playerPokemon é válido e está vivo.
+    const currentActivePlayerPokemon = playerPokemon; // Guarda referência caso troque.
+
+    switch (action) {
+      case BattleAction.ATTACK:
+        this.battleScreen.message = ""; // Limpa mensagem de efetividade anterior
+        const damageToWild = this.calculateDamage(currentActivePlayerPokemon, this.wildPokemon);
+        this.wildPokemon.takeDamage(damageToWild);
+        playerActionMessage = `${currentActivePlayerPokemon.name} atacou ${this.wildPokemon.name} causando ${damageToWild} de dano.${this.battleScreen.message}`;
+        if (this.wildPokemon.currentHp === 0) {
+          this.handleVictory(playerActionMessage);
+          enemyTurnShouldOccur = false;
+          return;
+        }
+        break;
+
+      case BattleAction.ITEM:
+        const itemType = payload as ItemType;
+        if (itemType === ItemType.POTION) {
+          if (this.player.inventory.getItemCount(ItemType.POTION) > 0) {
+            if (currentActivePlayerPokemon.currentHp < currentActivePlayerPokemon.stats.maxHp) {
+              this.player.inventory.removeItem(ItemType.POTION);
+              POTION.action?.(currentActivePlayerPokemon);
+              playerActionMessage = `Você usou ${ItemType.POTION} em ${currentActivePlayerPokemon.name}.`;
+              this.database.savePlayerInventory(this.player.inventory.toSaveData());
+            } else {
+                playerActionMessage = `${currentActivePlayerPokemon.name} já está com HP máximo.`;
+                enemyTurnShouldOccur = false;
+            }
+          } else {
+            playerActionMessage = `Você não tem ${ItemType.POTION}.`;
+            enemyTurnShouldOccur = false;
+          }
+        } else if (itemType === ItemType.POKEBALL) {
+          if (this.player.inventory.getItemCount(ItemType.POKEBALL) > 0) {
+            this.player.inventory.removeItem(ItemType.POKEBALL);
+            this.database.savePlayerInventory(this.player.inventory.toSaveData());
+            playerActionMessage = `Você usou ${ItemType.POKEBALL}!`;
+            this.attemptCapture(playerActionMessage);
+            enemyTurnShouldOccur = false; // attemptCapture lida com o turno do inimigo
+            return;
+          } else {
+            playerActionMessage = `Você não tem ${ItemType.POKEBALL}.`;
+            enemyTurnShouldOccur = false;
+          }
+        }
+        break;
+
+      case BattleAction.POKEMON:
+        const pokemonIndex = payload as number;
+        if (this.player.team[pokemonIndex] !== currentActivePlayerPokemon && this.player.team[pokemonIndex].currentHp > 0) {
+            if (this.player.switchPokemon(pokemonIndex)) {
+              playerPokemon = this.player.getActivePokemon(); // Atualiza o pokémon ativo localmente
+              playerActionMessage = `Você trocou para ${playerPokemon!.name}.`;
+            } else {
+              playerActionMessage = "Não foi possível trocar o Pokémon.";
+              enemyTurnShouldOccur = false;
+            }
+        } else if (this.player.team[pokemonIndex] === currentActivePlayerPokemon) {
+            playerActionMessage = "Este Pokémon já está em batalha!";
+            enemyTurnShouldOccur = false;
+        } else {
+            playerActionMessage = "Não pode trocar por um Pokémon caído!";
+            enemyTurnShouldOccur = false;
+        }
+        break;
+
+      case BattleAction.FLEE:
+        playerActionMessage = "Você fugiu da batalha!";
+        this.endBattle(false, true, false, playerActionMessage);
+        enemyTurnShouldOccur = false;
+        return;
+    }
+
+    // Atualiza a tela com a ação do jogador
+    // `playerPokemon` aqui pode ser o novo Pokémon após uma troca
+    const pokemonParaExibir = this.player.getActivePokemon() || currentActivePlayerPokemon;
+    this.battleScreen.updateBattleState(pokemonParaExibir, this.wildPokemon, playerActionMessage);
+    this.battleScreen.render();
+
+    // Turno do Inimigo
+    if (enemyTurnShouldOccur && this.wildPokemon.currentHp > 0) {
+        setTimeout(() => {
+            this.battleScreen.message = ""; // Limpa para a mensagem de efetividade do inimigo
+            
+            // É crucial pegar o Pokémon ativo do jogador AQUI, APÓS a ação do jogador
+            // (especialmente se foi uma troca ou se o Pokémon ativo mudou por outra razão)
+            const pokemonAlvoDoJogador = this.player.getActivePokemon();
+
+            if (!pokemonAlvoDoJogador) { // Verificação de segurança
+                console.error("ERRO CRÍTICO: Pokémon do jogador tornou-se indefinido antes do ataque selvagem.");
+                this.endBattle(false, false, false, playerActionMessage + "\nOcorreu um erro e a batalha não pode continuar.");
+                return;
+            }
+
+            const damageToPlayer = this.calculateDamage(this.wildPokemon, pokemonAlvoDoJogador);
+            pokemonAlvoDoJogador.takeDamage(damageToPlayer);
+            
+            // Construir mensagem do ataque selvagem usando o nome do Pokémon alvo (que sabemos que existe)
+            let wildActionMessage = `${this.wildPokemon.name} atacou ${pokemonAlvoDoJogador.name} causando ${damageToPlayer} de dano.${this.battleScreen.message}`;
+
+            if (pokemonAlvoDoJogador.currentHp === 0) {
+                wildActionMessage += `\n${pokemonAlvoDoJogador.name} foi derrotado!`;
+                const nextPokemon = this.player.team.find(p => p.currentHp > 0);
+                if (nextPokemon) {
+                    wildActionMessage += "\nEscolha o próximo Pokémon.";
+                    // O BattleScreen precisa entrar no modo de seleção de Pokémon
+                    this.battleScreen.updateBattleState(pokemonAlvoDoJogador, this.wildPokemon, playerActionMessage + "\n" + wildActionMessage);
+                    this.battleScreen.render();
+                    // Não chama endBattle, espera o jogador trocar.
+                    // A BattleScreen deve ser atualizada para refletir a necessidade de troca.
+                    // O fluxo de input do BattleScreen deve agora lidar com a seleção.
+                    return; // Interrompe o fluxo normal aqui, pois o jogador precisa agir.
+                } else {
+                    wildActionMessage += "\nTodos os seus Pokémon foram derrotados!";
+                    this.endBattle(false, false, false, playerActionMessage + "\n" + wildActionMessage);
+                    return; // Batalha termina
+                }
+            }
+            // Atualiza a tela com a mensagem da ação do jogador E do inimigo
+            this.battleScreen.updateBattleState(pokemonAlvoDoJogador, this.wildPokemon, playerActionMessage + "\n" + wildActionMessage);
+            this.battleScreen.render();
+        }, 1000);
+    }
+  }
+
+  private attemptCapture(initialMessage: string): void {
+    const catchRateBase = 255; // Exemplo de taxa de captura base
+    const maxHp = this.wildPokemon.stats.maxHp;
+    const currentHp = this.wildPokemon.currentHp;
+
+    // Fórmula de exemplo para chance de captura (simplificada)
+    let catchChance = ((3 * maxHp - 2 * currentHp) * catchRateBase) / (3 * maxHp);
+    catchChance = Math.max(1, Math.min(catchChance / 255, 1)); // Normaliza para 0-1, mínimo de ~0.4%
+
+    const randomRoll = Math.random();
+    let captureMessage = "";
+
+    if (randomRoll < catchChance) {
+      captureMessage = `Gotcha! ${this.wildPokemon.name} foi capturado!`;
+      if (this.player.addPokemonToTeam(this.wildPokemon)) {
+        captureMessage += `\n${this.wildPokemon.name} foi adicionado à sua equipe.`;
+      } else {
+        captureMessage += `\nSua equipe está cheia. ${this.wildPokemon.name} foi enviado para o PC (não implementado).`;
+      }
+      this.database.savePlayerTeam(this.player.getTeamSaveData());
+      this.endBattle(true, false, true, initialMessage + "\n" + captureMessage);
+    } else {
+      captureMessage = `Oh não! O ${this.wildPokemon.name} escapou da Pokebola!`;
+      const fullMessage = initialMessage + "\n" + captureMessage;
+      
+      const pokemonAlvoDoJogadorAntesDoAtaque = this.player.getActivePokemon();
+      if (!pokemonAlvoDoJogadorAntesDoAtaque) {
+          this.endBattle(false, false, false, fullMessage + "\nSeu Pokémon não pôde continuar.");
+          return;
+      }
+
+      this.battleScreen.updateBattleState(pokemonAlvoDoJogadorAntesDoAtaque, this.wildPokemon, fullMessage);
+      this.battleScreen.render();
+
+      // Turno do selvagem após falha na captura
+      setTimeout(() => {
+        this.battleScreen.message = ""; // Limpa para a mensagem de efetividade do inimigo
+        
+        const pokemonAlvoDoJogadorNoTurnoInimigo = this.player.getActivePokemon();
+        if (!pokemonAlvoDoJogadorNoTurnoInimigo) { // Verificação de segurança
+            console.error("ERRO CRÍTICO: Pokémon do jogador indefinido antes do ataque selvagem pós-captura falha.");
+            this.endBattle(false, false, false, fullMessage + "\nOcorreu um erro e a batalha não pode continuar.");
+            return;
+        }
+
+        const damageToPlayer = this.calculateDamage(this.wildPokemon, pokemonAlvoDoJogadorNoTurnoInimigo);
+        pokemonAlvoDoJogadorNoTurnoInimigo.takeDamage(damageToPlayer);
+        let wildActionMessage = `${this.wildPokemon.name} atacou ${pokemonAlvoDoJogadorNoTurnoInimigo.name} causando ${damageToPlayer} de dano.${this.battleScreen.message}`;
+
+        if (pokemonAlvoDoJogadorNoTurnoInimigo.currentHp === 0) {
+            wildActionMessage += `\n${pokemonAlvoDoJogadorNoTurnoInimigo.name} foi derrotado!`;
+             const nextPokemon = this.player.team.find(p => p.currentHp > 0);
+            if (nextPokemon) {
+                wildActionMessage += "\nEscolha o próximo Pokémon.";
+                this.battleScreen.updateBattleState(pokemonAlvoDoJogadorNoTurnoInimigo, this.wildPokemon, fullMessage + "\n" + wildActionMessage);
+                this.battleScreen.render();
+                return; 
+            } else {
+                wildActionMessage += "\nTodos os seus Pokémon foram derrotados!";
+                this.endBattle(false, false, false, fullMessage + "\n" + wildActionMessage);
+                return;
+            }
+        }
+        this.battleScreen.updateBattleState(pokemonAlvoDoJogadorNoTurnoInimigo, this.wildPokemon, fullMessage + "\n" + wildActionMessage);
+        this.battleScreen.render();
+      }, 1000);
+    }
+  }
+
+  private handleVictory(previousMessage: string = ""): void {
+    const victor = this.player.getActivePokemon(); // Deve ser o Pokémon que acabou de lutar
+    if (!victor) { // Segurança: se por algum motivo não houver Pokémon ativo
+        console.error("Vitória processada sem Pokémon ativo do jogador.");
+        this.endBattle(true, false, false, previousMessage + "\nVitória! Mas ocorreu um erro ao processar XP.");
+        return;
+    }
+
+    const baseXP = 25; // Define um XP base
+    const xpGained = baseXP + Math.floor(this.wildPokemon.stats.level * 10);
+    const leveledUp = victor.gainXp(xpGained);
+    let victoryMessage = `${victor.name} derrotou ${this.wildPokemon.name}!`;
+    victoryMessage += `\n${victor.name} ganhou ${xpGained} XP.`;
+    if (leveledUp) {
+      victoryMessage += `\n${victor.name} subiu para o nível ${victor.stats.level}!`;
+    }
+    this.database.savePlayerTeam(this.player.getTeamSaveData()); // Salva o time com XP e possível level up
+    this.endBattle(true, false, false, (previousMessage ? previousMessage + "\n" : "") + victoryMessage);
+  }
+
+  private endBattle(isVictory: boolean, fled: boolean = false, captured: boolean = false, customMessage?: string): void {
+    let finalMessage = customMessage || "A batalha terminou.";
+
+    // Lógica para mensagens padrão se customMessage não for fornecido (embora geralmente seja)
+    if (fled && !customMessage) {
+        finalMessage = "Você fugiu da batalha.";
+    } else if (captured && !customMessage) {
+        // A mensagem de captura já é parte do customMessage em attemptCapture
+    } else if (isVictory && !captured && !customMessage) {
+        // A mensagem de vitória já é parte do customMessage em handleVictory
+    } else if (!isVictory && !fled && !captured && !customMessage) {
+        finalMessage = "Você foi derrotado...";
+    }
+
+    // Garante que há um Pokémon para exibir, mesmo que seja o primeiro da equipe (pode estar caído se for derrota total)
+    const pokemonToDisplay = this.player.getActivePokemon() || this.player.team[0] || new Pokemon(0, "Fantasma", "", {attack:0,defense:0,hp:0,maxHp:0,speed:0,type:PokemonType.NORMAL,level:1,xp:0,xpToNextLevel:100});
+    this.battleScreen.updateBattleState(pokemonToDisplay, this.wildPokemon, finalMessage);
+    this.battleScreen.render();
+
+    setTimeout(() => {
+      this.onBattleEnd(); // Chama o callback para retornar ao GameController
+    }, 2500);
+  }
+}
+
+//GameController.ts
+
+import Map from "../model/Map";
+import Player from "../model/Player";
+import GameView from "../view/GameView";
+import Database, { PokemonDefinition } from "../db/Database";
+import * as readline from "readline";
+import Screen from "../view/Screen";
+import InventoryScreen from "../view/InventoryScreen";
+import BattleController from "./BattleController";
+import BattleScreen from "../view/BattleScreen";
+import Pokemon from "../model/Pokemon";
+import { PokemonType } from "../enum/PokemonType";
+import { ItemType } from "../model/Item";
+
+interface BushEncounter {
+  pokemonId: number;
+  minLevel: number;
+  maxLevel: number;
+  chance: number;
+}
+
+const BUSH_ENCOUNTERS_MAPA1: BushEncounter[] = [
+  { pokemonId: 2, minLevel: 2, maxLevel: 5, chance: 0.4 }, // Charmander
+  { pokemonId: 3, minLevel: 2, maxLevel: 5, chance: 0.4 }, // Squirtle
+  { pokemonId: 4, minLevel: 2, maxLevel: 5, chance: 0.4 }, // Bulbasaur
+  { pokemonId: 1, minLevel: 3, maxLevel: 7, chance: 0.2 }, // Pikachu
+];
+
+export default class GameController {
+  private modelMap!: Map;
+  private modelPlayer!: Player;
+  private gameView!: GameView;
+  private db!: Database;
+  private currentScreenHandler: Screen | null = null;
+  private battleController: BattleController | null = null;
+  private inBattle: boolean = false;
+  private previousPlayerX: number = 0;
+  private previousPlayerY: number = 0;
+  private mapInteractionMessage: string | null = null;
+
+  constructor(private mapFile: string, private dbFile?: string) {}
+
+  private initializeCommonComponents(loadPlayerFromDb: boolean): void {
+    this.modelMap = new Map(this.mapFile);
+    this.modelMap.load();
+    this.db = new Database(this.dbFile);
+
+    let playerX, playerY;
+    if (loadPlayerFromDb) {
+      const pos = this.db.getPlayerPosition();
+      playerX = pos.x;
+      playerY = pos.y;
+    } else {
+      playerX = 14;
+      playerY = 6;
+    }
+
+    const pikachuDef = this.db.getPokemonDefinitionById(1);
+    // CORREÇÃO APLICADA AQUI:
+    let initialPokemon: Pokemon | null = null;
+
+    if (pikachuDef) {
+      // Agora a atribuição é válida, pois initialPokemon pode ser Pokemon | null
+      initialPokemon = this.db.instantiatePokemon(
+        pikachuDef.id,
+        pikachuDef.stats.baseLevel || 5
+      );
+    }
+
+    // Se initialPokemon for null (seja porque pikachuDef não existe ou instantiatePokemon retornou null),
+    // o bloco if abaixo será executado.
+    if (!initialPokemon) {
+      console.error(
+        "Não foi possível criar o Pokémon inicial (Pikachu)! Usando FallbackMon."
+      );
+      const fallbackStats = {
+        attack: 10,
+        defense: 10,
+        hp: 20,
+        maxHp: 20,
+        speed: 10,
+        type: PokemonType.NORMAL,
+        level: 5,
+        xp: 0,
+        xpToNextLevel: 100,
+      };
+      initialPokemon = new Pokemon(
+        0,
+        "FallbackMon",
+        "Fallback Art",
+        fallbackStats
+      ); // initialPokemon se torna uma instância de Pokemon
+    }
+
+    // Neste ponto, initialPokemon é garantidamente uma instância de Pokemon (não null).
+    // O construtor de Player espera `initialPokemon?: Pokemon` (ou seja, Pokemon | undefined).
+    // Como initialPokemon é Pokemon aqui, a atribuição é válida.
+    this.modelPlayer = new Player(playerX, playerY, initialPokemon);
+
+    if (loadPlayerFromDb) {
+      this.modelPlayer.inventory.fromSaveData(this.db.getPlayerInventory());
+      const teamData = this.db.getPlayerTeamData();
+      const allPokemonBaseDefinitions = this.db.getAllPokemonDefinitions();
+      const instantiatedPokemons: Pokemon[] = [];
+      allPokemonBaseDefinitions.forEach((def) => {
+        const instance = this.db.instantiatePokemon(
+          def.id,
+          def.stats.baseLevel || 1
+        );
+        if (instance) {
+          // instance aqui é Pokemon | null, então verificamos se é Pokemon
+          instantiatedPokemons.push(instance);
+        }
+      });
+      this.modelPlayer.loadTeamFromData(teamData, instantiatedPokemons);
+    } else {
+      this.db.saveGameData(this.modelPlayer);
+    }
+
+    this.gameView = new GameView(this.modelMap, this.modelPlayer);
+  }
+
+  public startNew(): void {
+    this.initializeCommonComponents(false);
+    this.inBattle = false;
+    this.currentScreenHandler = null;
+  }
+
+  public startContinue(): void {
+    this.initializeCommonComponents(true);
+    this.inBattle = false;
+    this.currentScreenHandler = null;
+  }
+
+  public render(): void {
+    if (this.inBattle && this.battleController) {
+      this.battleController.getScreen().render();
+    } else if (this.currentScreenHandler) {
+      this.currentScreenHandler.render();
+    } else if (this.gameView) {
+      this.gameView.render();
+    }
+  }
+
+  public handleInput(cmd: string): void {
+    if (this.inBattle && this.battleController) {
+      this.battleController.getScreen().handleInput(cmd); // <-- Foco aqui
+      return;
+    }
+
+    if (this.currentScreenHandler) {
+      const nextScreen = this.currentScreenHandler.handleInput(cmd);
+      if (nextScreen === null) {
+        this.currentScreenHandler = null;
+      } else if (nextScreen !== this.currentScreenHandler) {
+        this.currentScreenHandler = nextScreen;
+        this.currentScreenHandler?.onEnter?.();
+      }
+      this.currentScreenHandler?.render();
+      return;
+    }
+
+    let triggeredBattle = false;
+    switch (cmd) {
+      case "up":
+      case "down":
+      case "left":
+      case "right":
+        this.previousPlayerX = this.modelPlayer.x;
+        this.previousPlayerY = this.modelPlayer.y;
+        const moveResult = this.modelPlayer.move(
+          cmd === "left" ? -1 : cmd === "right" ? 1 : 0,
+          cmd === "up" ? -1 : cmd === "down" ? 1 : 0,
+          this.modelMap
+        );
+        if (moveResult === '"') {
+          if (this.modelPlayer.getActivePokemon()) {
+            // Só tenta batalha se tiver Pokémon
+            triggeredBattle = this.tryStartBattle();
+          } else {
+            console.log(
+              "Você não tem Pokémon para batalhar! Visite um Centro Pokémon (não implementado)."
+            );
+            // Impede o jogador de se mover para a grama ou reverte o movimento
+            this.modelPlayer.x = this.previousPlayerX;
+            this.modelPlayer.y = this.previousPlayerY;
+          }
+        }
+        break;
+      case "i":
+        this.currentScreenHandler = new InventoryScreen(this.modelPlayer, this);
+        this.currentScreenHandler.onEnter?.();
+        this.currentScreenHandler.render();
+        return;
+      default:
+        return;
+    }
+
+    if (!triggeredBattle) {
+      this.gameView.render();
+    }
+    this.db.saveGameData(this.modelPlayer);
+  }
+
+  private tryStartBattle(): boolean {
+    const encounterChance = 0.25;
+    if (Math.random() < encounterChance) {
+      const availableEncounters = BUSH_ENCOUNTERS_MAPA1.filter(
+        (enc) => Math.random() < enc.chance
+      );
+      if (availableEncounters.length > 0) {
+        const encounterDef =
+          availableEncounters[
+            Math.floor(Math.random() * availableEncounters.length)
+          ];
+        const level =
+          Math.floor(
+            Math.random() * (encounterDef.maxLevel - encounterDef.minLevel + 1)
+          ) + encounterDef.minLevel;
+
+        const wildPokemonBase = this.db.getPokemonDefinitionById(
+          encounterDef.pokemonId
+        );
+        if (wildPokemonBase) {
+          const wildPokemonInstance = this.db.instantiatePokemon(
+            wildPokemonBase.id,
+            level
+          );
+          // Verificação crucial: o jogador DEVE ter um Pokémon ativo para iniciar a batalha.
+          if (wildPokemonInstance && this.modelPlayer.getActivePokemon()) {
+            this.startBattle(wildPokemonInstance);
+            return true;
+          } else if (!this.modelPlayer.getActivePokemon()) {
+            // Esta mensagem pode ser redundante se a verificação em handleInput já ocorreu.
+            console.log(
+              "Você precisa de um Pokémon ativo para entrar em batalhas!"
+            );
+            // Reverter o movimento para fora da grama
+            this.modelPlayer.x = this.previousPlayerX;
+            this.modelPlayer.y = this.previousPlayerY;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  private startBattle(wildPokemon: Pokemon): void {
+    this.inBattle = true;
+    this.modelPlayer.lastMapPosition = {
+      x: this.previousPlayerX,
+      y: this.previousPlayerY,
+    };
+    this.battleController = new BattleController(
+      this.modelPlayer,
+      wildPokemon,
+      this,
+      this.db,
+      () => {
+        this.endBattle();
+      }
+    );
+    this.battleController.getScreen().render();
+  }
+
+  private endBattle(): void {
+    this.inBattle = false;
+    this.battleController = null;
+    // Retorna o jogador para a posição ANTES de entrar no tile que causou a batalha
+    // ou para a posição atual se a batalha não foi por tile (ex: NPC)
+    if (
+      this.modelPlayer.lastMapPosition.x !== this.modelPlayer.x ||
+      this.modelPlayer.lastMapPosition.y !== this.modelPlayer.y
+    ) {
+      // Apenas reverte se a posição de `lastMapPosition` for diferente da atual (evita ficar preso se a batalha for iniciada de outra forma)
+      // e se a batalha não terminou com todos os pokemons do jogador derrotados (black out - não implementado aqui)
+      const activePokemon = this.modelPlayer.getActivePokemon();
+      if (activePokemon) {
+        // Se o jogador ainda tem pokemons, volta para a posição anterior.
+        this.modelPlayer.x = this.modelPlayer.lastMapPosition.x;
+        this.modelPlayer.y = this.modelPlayer.lastMapPosition.y;
+      } else {
+        // Lógica de "black out" - levar para o Centro Pokémon mais próximo (não implementado)
+        // Por agora, apenas mantém na posição atual ou última posição segura.
+        console.log("Você não tem mais Pokémon capazes de lutar!");
+        // Poderia mover para uma posição segura padrão.
+      }
+    }
+
+    this.db.saveGameData(this.modelPlayer);
+    this.currentScreenHandler = null;
+    this.gameView.render();
+  }
+
+  public resumeGame(): void {
+    this.currentScreenHandler = null;
+    this.gameView.render();
+  }
+
+  public getDatabase(): Database {
+    return this.db;
+  }
+}
+
+
+// Database.ts
+
+import * as fs from "fs";
+import * as path from "path";
+import { Item, ItemType } from "../model/Item";
+import Pokemon, { PokemonStats } from "../model/Pokemon";
+import { PokemonType } from "../enum/PokemonType";
+import PlayerModel from "../model/Player";
+
+// Definindo a estrutura dos dados de um Pokémon no "banco de dados"
+export interface PokemonDefinition {
+  id: number;
+  name: string;
+  asciiArt: string;
+  stats: Omit<
+    PokemonStats,
+    "hp" | "maxHp" | "level" | "xp" | "xpToNextLevel"
+  > & { baseHp: number; baseLevel?: number }; // Base stats
+}
+
+// Dados do Pokémon do jogador que são salvos
+export interface PokemonData {
+  id: number; // Para referenciar a PokemonDefinition
+  level: number;
+  xp: number;
+  currentHp: number;
+}
+
+interface SaveData {
+  playerPosition: { x: number; y: number };
+  playerInventory: { [key: string]: number };
+  playerTeam: PokemonData[];
+  // Adicionar outros dados do jogo a serem salvos, como monstros no PC, etc.
+}
+
+const PIKACHU_ART = `
+⠀⠀⠀⠀⠀⠀⣰⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⣰⠟⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡀⠀
+⠀⠀⠀⠀⢀⠁⠀⠇⠀⠀⠀⠀⠀⠀⠀⢀⠀⠤⠀⠒⣶⣶⠆⠀⠀⢀⠔⠁⢠⠀
+⠀⠀⠀⠀⠘⢀⠼⠤⠀⠀⠀⠄⡠⠐⠈⠀⠀⠀⠀⡰⠟⠁⠀⢀⠔⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⢜⡁⠀⠀⠀⣖⣦⠀⠀⠤⣤⠄⠐⠂⠁⠀⠀⢀⠔⠁⠀⠀⠀⠀⠀⡇
+⠀⠀⠀⡸⠷⢁⡀⢀⡀⠈⢉⠤⢄⠀⠈⡀⠀⠀⠀⠀⣔⡁⠄⠄⠀⠀⢀⠠⠂⠁
+⠀⠀⢠⢻⠀⠹⣿⠿⡇⠀⠡⠔⠜⠀⠀⢁⠀⠀⠀⠀⢡⠀⠀⢀⠄⠊⠁⠀⠀⠀
+⠀⠀⠀⠫⡀⠀⠐⠤⠃⠀⠀⠀⠀⢀⠀⠀⢂⠀⠀⠀⠀⢃⠀⠸⠀⠀⠀⠀⠀⠀
+⢀⠠⠐⠂⠉⠢⠀⡀⠀⠀⠀⠀⠖⠉⠉⠀⠀⢧⡀⠀⡠⠒⠀⡠⠀⠀⠀⠀⠀⠀
+⢸⡘⠀⠀⠀⠀⢢⠈⠂⠀⠀⠀⠘⢤⣄⣤⠄⠀⠈⢊⠢⣠⣎⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠉⠀⠒⠒⠀⢣⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠗⣾⠿⠆⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢸⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡷⠄⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠘⡀⠀⠀⠀⣀⣀⠀⠀⢀⣀⡀⠤⢊⠆⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠐⠢⢤⣥⠒⠉⠉⠑⠂⠠⠤⡤⢺⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⢛⠀⠀⠀⠀⠀⠀⠀⠐⢾⠀⠀⠀⠀⠀⠀⠀⠀⠀
+`;
+
+const CHARMANDER_ART = `
+   ⠀⠀⢀⠤⠐⠒⠂⠄⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⣰⠇⠀⠀⠀⢠⡀⠑⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⣠⠟⠀⠀⠀⠀⣮⣾⡆⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⡘⠀⠀⠀⠀⠀⠀⠯⠭⠃⠘⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⡀⠱⣄⣀⠐⠀⣀⣀⣀⠠⠂⢠⠀⠀⠀⠀⠀⠀⠀⠀⢠⢤⡀⠀
+⢰⣳⠁⠚⢿⠄⣀⡠⣔⢪⠒⠁⠼⠄⠐⠈⠵⣧⠀⠀⠀⣇⡀⠱⡀
+⠀⠈⢀⠀⠀⡜⠀⠀⠀⠀⠑⡀⠀⠀⠀⢀⠜⠁⠀⠀⠀⡆⠹⡄⡣
+⠀⠀⠀⠑⢠⠀⠀⠀⠀⠀⠀⠐⡀⠀⢊⠁⠀⠀⠀⠀⠀⠸⣀⣹⠇
+⠀⠀⠀⠀⢸⠀⠀⠀⠀⠀⠀⠀⢡⠀⠈⡄⠀⠀⠀⠀⠀⠀⡘⠀⠀
+⠀⠀⠀⠀⠀⢇⠀⠀⠀⠀⠀⠀⢸⠀⠀⢠⠀⠀⠀⠀⢀⠔⠀⠇⠀
+⠀⠀⠀⢀⠔⠉⢂⠀⠀⠀⠀⠀⡜⠒⠀⢺⠁⠐⠂⠈⠁⠀⠜⠀⠀
+⠀⠀⠀⠸⡀⠀⠀⠁⠢⠄⣀⡔⠀⠀⠀⢸⠀⠀⠀⢀⠠⠊⠀⠀⠀
+⠀⢀⣠⠒⠉⠀⠀⠀⢪⠀⠀⡱⠀⠀⠠⡎⠉⠉⠉⠀⠀⠀⠀⠀⠀
+⠀⠈⠛⠑⠒⠒⠀⠈⠁⠀⠀⠙⢵⡵⡯⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀
+`;
+
+const SQUIRTLE_ART = `
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠤⠐⠒⠒⠂⠠⡀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠊⠀⠀⡠⢠⠂⠀⠀⠀⠡⡀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠇⠀⠀⢰⣷⣾⠀⠀⠀⠀⠀⡇⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⡠⠜⢨⠢⠔⡀⠀⠠⠘⠛⠛⠀⠀⠀⠀⢸⡇⠀
+⠀⠀⠀⢀⣀⣀⠀⠀⠀⠰⠀⠀⠀⠀⠡⡀⠀⠈⠀⠒⠂⠄⡀⢀⠀⡀⠀
+⠀⡴⠊⠀⠀⠀⠉⢆⠀⡔⢣⠀⠀⠀⠀⠐⡤⣀⠀⠀⠀⠀⠀⣀⠄⠀⠀
+⢸⠀⠀⠀⢠⠀⠀⠈⣼⠀⠀⠣⠀⠀⠀⡰⡀⠀⠉⠀⠀⠰⠉⠀⠁⠠⢄
+⢰⠀⠀⠀⠀⠇⠀⢀⢿⠀⢀⠇⡐⠀⠈⠀⠈⠐⠠⠤⠤⠤⠀⠀⠀⠀⢨
+⠀⢓⠤⠤⠊⠀⠀⢸⠀⠣⠀⡰⠁⠀⠀⡀⠀⠀⠀⠸⠀⢰⠁⠐⠂⠈⠁
+⠀⠀⠑⢀⠀⠀⠀⠈⣄⠖⠉⠑⢄⠠⠊⠀⠢⢄⣠⣃⣀⡆⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠑⠠⢀⣀⠎⠀⠀⠀⠈⡄⠀⠀⠀⢠⢃⠠⠃⠐⡀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠸⠀⠀⠀⠀⢀⠯⠉⠤⢴⡃⠁⠀⠀⠀⡇⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠰⡁⠀⠀⠀⠠⠂⠀⠀⠀⠀⠑⢄⠀⠀⢀⠲⠁⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠘⠒⠑⠔⠁⠀⠀⠀⠀⠀⠀⠀⠁⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀
+`;
+
+const BULBASAUR_ART = `
+    ⠀⠀⠀⠀⠀⠀⣀⣀⣀⣀⣀⡀⠈⡖⡤⠄⠀
+⠀⠀⢀⡀⠀⠀⠀⡐⠁⠀⠀⠠⠐⠂⠀⠁⠀⠀⠀⠀
+⠀⠰⡁⠐⢉⣉⣭⡍⠁⠂⠉⠘⡀⠀⠀⠀⠀⠂⠡⠀
+⢀⣊⠀⡄⠻⠿⠋⠀⠀⠀⠀⠀⢃⠀⠀⠀⠀⠀⠀⢀
+⡎⣾⠀⠁⣴⡆⠀⠡⢺⣿⣆⠀⢠⢱⣄⠀⠀⠀⠀⠈
+⡑⠟⠀⠀⠀⠀⠀⢀⣸⡿⠟⠀⠀⠈⢿⣿⡦⡀⠀⡰
+⠙⠔⠦⣤⣥⣤⣤⣤⡤⠆⠀⠀⠀⠀⢀⢀⠀⠈⠎⠀
+⠀⠀⠈⣰⡋⢉⠉⠁⠒⠂⢇⢠⡆⠀⠸⢴⣿⠀⠘⠀
+⠀⠀⠘⡿⠃⠀⠨⠒⢆⣸⣿⠁⠀⡠⡇⠈⠋⠀⠰⠀
+⠀⠀⠀⠛⠒⠒⠁⠀⠈⠷⡤⠤⠐⠀⠘⠒⠒⠖⠁⠀
+`;
+
+export default class Database {
+  private filePath: string;
+  private data: SaveData;
+  private allPokemonDefinitions: PokemonDefinition[]; // Todos os pokemons base
+
+  constructor(filename: string = "db.json") {
+    this.filePath = path.resolve(process.cwd(), filename);
+    this.allPokemonDefinitions = [
+      {
+        id: 1,
+        name: "Pikachu",
+        asciiArt: PIKACHU_ART,
+        stats: {
+          attack: 55,
+          defense: 40,
+          baseHp: 35,
+          speed: 90,
+          type: PokemonType.ELECTRIC,
+          baseLevel: 5,
+        },
+      },
+      {
+        id: 2,
+        name: "Charmander",
+        asciiArt: CHARMANDER_ART,
+        stats: {
+          attack: 52,
+          defense: 43,
+          baseHp: 39,
+          speed: 65,
+          type: PokemonType.FIRE,
+          baseLevel: 5,
+        },
+      },
+      {
+        id: 3,
+        name: "Squirtle",
+        asciiArt: SQUIRTLE_ART,
+        stats: {
+          attack: 48,
+          defense: 65,
+          baseHp: 44,
+          speed: 43,
+          type: PokemonType.WATER,
+          baseLevel: 5,
+        },
+      },
+      {
+        id: 4,
+        name: "Bulbasaur",
+        asciiArt: BULBASAUR_ART,
+        stats: {
+          attack: 49,
+          defense: 49,
+          baseHp: 45,
+          speed: 45,
+          type: PokemonType.GRASS,
+          baseLevel: 5,
+        },
+      },
+      // Adicionar mais pokemons aqui
+    ];
+    this.data = this.load();
+  }
+
+  private load(): SaveData {
+    const defaultData: SaveData = {
+      playerPosition: { x: 14, y: 6 }, // Posição inicial padrão
+      playerInventory: { [ItemType.POKEBALL]: 5, [ItemType.POTION]: 3 },
+      playerTeam: [
+        {
+          id: 1,
+          level: 5,
+          xp: 0,
+          currentHp:
+            this.getPokemonDefinitionById(1)!.stats.baseHp + (5 - 1) * 5,
+        },
+      ], // Pikachu inicial
+    };
+
+    if (fs.existsSync(this.filePath)) {
+      try {
+        const fileData = JSON.parse(fs.readFileSync(this.filePath, "utf-8"));
+        // Merge para garantir que todos os campos existam, mesmo que o save antigo não os tenha
+        return { ...defaultData, ...fileData };
+      } catch (error) {
+        console.error(
+          "Erro ao carregar o banco de dados, usando dados padrão:",
+          error
+        );
+        return defaultData;
+      }
+    } else {
+      this.persist(defaultData); // Cria o arquivo com dados padrão se não existir
+      return defaultData;
+    }
+  }
+
+  private persist(dataToSave?: SaveData): void {
+    fs.writeFileSync(
+      this.filePath,
+      JSON.stringify(dataToSave || this.data, null, 2)
+    );
+  }
+
+  public getPokemonDefinitionById(id: number): PokemonDefinition | undefined {
+    return this.allPokemonDefinitions.find((p) => p.id === id);
+  }
+
+  public getAllPokemonDefinitions(): PokemonDefinition[] {
+    return [...this.allPokemonDefinitions];
+  }
+
+  // Método para instanciar um Pokémon a partir da definição e nível
+  public instantiatePokemon(id: number, level: number): Pokemon | null {
+    const definition = this.getPokemonDefinitionById(id);
+    if (!definition) return null;
+
+    const stats: PokemonStats = {
+      attack: definition.stats.attack,
+      defense: definition.stats.defense,
+      hp: definition.stats.baseHp, // HP será ajustado pelo levelUp
+      maxHp: definition.stats.baseHp,
+      speed: definition.stats.speed,
+      type: definition.stats.type,
+      level: 1, // Começa em 1 para o levelUp funcionar
+      xp: 0,
+      xpToNextLevel: 100, // Exemplo, pode ser mais complexo
+    };
+
+    const newPokemon = new Pokemon(
+      definition.id,
+      definition.name,
+      definition.asciiArt,
+      stats
+    );
+    // Simular level ups até o nível desejado para ajustar os stats
+    for (let i = 1; i < level; i++) {
+      newPokemon.stats.level++;
+      newPokemon.stats.maxHp += 5; // Exemplo de aumento
+      newPokemon.stats.hp = newPokemon.stats.maxHp;
+      newPokemon.stats.attack += 2;
+      newPokemon.stats.defense += 2;
+      newPokemon.stats.speed += 1;
+      newPokemon.stats.xpToNextLevel = Math.floor(
+        newPokemon.stats.xpToNextLevel * 1.5
+      );
+    }
+    newPokemon.currentHp = newPokemon.stats.maxHp; // Garante HP cheio
+
+    return newPokemon;
+  }
+
+  getPlayerPosition(): { x: number; y: number } {
+    return { ...this.data.playerPosition };
+  }
+
+  savePlayerPosition(x: number, y: number): void {
+    this.data.playerPosition = { x, y };
+    this.persist();
+  }
+
+  getPlayerInventory(): { [key: string]: number } {
+    return { ...this.data.playerInventory };
+  }
+
+  savePlayerInventory(inventoryData: { [key: string]: number }): void {
+    this.data.playerInventory = inventoryData;
+    this.persist();
+  }
+
+  getPlayerTeamData(): PokemonData[] {
+    return JSON.parse(JSON.stringify(this.data.playerTeam)); // Retorna uma cópia profunda
+  }
+
+  savePlayerTeam(teamData: PokemonData[]): void {
+    this.data.playerTeam = teamData;
+    this.persist();
+  }
+
+  // Método para salvar todos os dados do jogo de uma vez
+  saveGameData(player: PlayerModel): void {
+    this.data.playerPosition = { x: player.x, y: player.y };
+    this.data.playerInventory = player.inventory.toSaveData();
+    this.data.playerTeam = player.getTeamSaveData();
+    this.persist();
+  }
+}
+
+
+//BattleAction.ts
+
+export enum BattleAction {
+  ATTACK,
+  ITEM,
+  POKEMON,
+  FLEE,
+}
+
+//PokemonType.ts
+
+export enum PokemonType {
+  NORMAL = 'Normal',
+  FIRE = 'Fire',
+  WATER = 'Water',
+  GRASS = 'Grass',
+  ELECTRIC = 'Electric',
+  ROCK = 'Rock',
+}
+
+export const TypeChart: { [key in PokemonType]?: { strongAgainst: PokemonType[], weakAgainst: PokemonType[] } } = {
+  [PokemonType.FIRE]: { strongAgainst: [PokemonType.GRASS], weakAgainst: [PokemonType.WATER, PokemonType.ROCK] },
+  [PokemonType.WATER]: { strongAgainst: [PokemonType.FIRE, PokemonType.ROCK], weakAgainst: [PokemonType.GRASS, PokemonType.ELECTRIC] },
+  [PokemonType.GRASS]: { strongAgainst: [PokemonType.WATER, PokemonType.ROCK], weakAgainst: [PokemonType.FIRE] },
+  [PokemonType.ELECTRIC]: { strongAgainst: [PokemonType.WATER], weakAgainst: [PokemonType.GRASS, PokemonType.ROCK] },
+  [PokemonType.ROCK]: { strongAgainst: [PokemonType.FIRE, PokemonType.ELECTRIC], weakAgainst: [PokemonType.WATER, PokemonType.GRASS] },
+  [PokemonType.NORMAL]: { strongAgainst: [], weakAgainst: [] }, // Normal não tem vantagens ou desvantagens diretas aqui
+};
+
+//Inventory.ts
+
+import { Item, ItemType } from './Item';
+
+export default class Inventory {
+  private items: Map<ItemType, number> = new Map();
+
+  constructor() {
+    // Itens iniciais (pode ser carregado do DB também)
+    this.addItem(ItemType.POKEBALL, 5);
+    this.addItem(ItemType.POTION, 3);
+  }
+
+  addItem(itemType: ItemType, quantity: number = 1): void {
+    this.items.set(itemType, (this.items.get(itemType) || 0) + quantity);
+  }
+
+  removeItem(itemType: ItemType, quantity: number = 1): boolean {
+    const currentQuantity = this.items.get(itemType);
+    if (currentQuantity && currentQuantity >= quantity) {
+      this.items.set(itemType, currentQuantity - quantity);
+      if (this.items.get(itemType) === 0) {
+        this.items.delete(itemType);
+      }
+      return true;
+    }
+    return false; // Não tinha o item ou quantidade insuficiente
+  }
+
+  getItemCount(itemType: ItemType): number {
+    return this.items.get(itemType) || 0;
+  }
+
+  getItems(): Map<ItemType, number> {
+    return this.items;
+  }
+
+  // Para salvar e carregar do DB
+  toSaveData(): { [key: string]: number } {
+    const data: { [key: string]: number } = {};
+    this.items.forEach((qty, item) => {
+      data[item] = qty;
+    });
+    return data;
+  }
+
+  fromSaveData(data: { [key: string]: number }): void {
+    this.items.clear();
+    for (const itemName in data) {
+      this.addItem(itemName as ItemType, data[itemName]);
+    }
+  }
+}
+
+// Item.ts
+
+export enum ItemType {
+  POKEBALL = 'Pokebola',
+  POTION = 'Poção de Cura',
+}
+
+export interface Item {
+  name: ItemType;
+  description: string;
+  action?: (target?: any) => void; // Ação que o item realiza
+}
+
+export const POKEBALL: Item = {
+  name: ItemType.POKEBALL,
+  description: 'Use para tentar capturar um monstro selvagem.',
+};
+
+export const POTION: Item = {
+  name: ItemType.POTION,
+  description: 'Restaura 20 HP de um monstro.',
+  action: (target: import('./Pokemon').default) => {
+    if (target) {
+      target.heal(20);
+      console.log(`${target.name} foi curado em 20 HP!`);
+    }
+  },
+};
+
+//Map.ts
+
+import * as fs from "fs";
+import * as path from "path";
+
+export default class Map {
+  private grid: string[][] = [];
+  constructor(private filename: string) {}
+
+  load(): void {
+    // Se filename for relativo, resolve em relação à pasta dist/model
+    const fullPath = path.isAbsolute(this.filename)
+      ? this.filename
+      : path.resolve(__dirname, this.filename);
+
+    const content = fs.readFileSync(fullPath, "utf-8");
+    this.grid = content.split("\n").map((line) => line.split(""));
+  }
+
+  getCell(x: number, y: number): string {
+    if (y < 0 || y >= this.grid.length) return "#";
+    if (x < 0 || x >= this.grid[y].length) return "#";
+    return this.grid[y][x];
+  }
+
+  get width(): number {
+    return this.grid[0]?.length || 0;
+  }
+
+  get height(): number {
+    return this.grid.length;
+  }
+}
+
+
+//Player.ts
+
+import Map from './Map';
+import Pokemon from './Pokemon';
+import Inventory from './Inventory';
+import { PokemonData } from '../db/Database'; // Será criada/modificada em Database.ts
+
+export default class PlayerModel {
+  public team: Pokemon[] = [];
+  public inventory: Inventory;
+  private maxTeamSize: number = 6;
+  public lastMapPosition: { x: number; y: number }; // Para retornar após batalha
+
+  constructor(public x: number, public y: number, initialPokemon?: Pokemon) {
+    this.inventory = new Inventory();
+    if (initialPokemon) {
+      this.addPokemonToTeam(initialPokemon);
+    }
+    this.lastMapPosition = { x, y };
+  }
+
+  move(dx: number, dy: number, map: Map): string | null { // Retorna o tipo de tile ou null
+    const nx = this.x + dx;
+    const ny = this.y + dy;
+    const nextCell = map.getCell(nx, ny);
+
+    if (nextCell === ' ' || nextCell === '"') { // Permite andar na grama
+      this.x = nx;
+      this.y = ny;
+      this.lastMapPosition = { x: this.x, y: this.y }; // Salva a posição antes de uma possível batalha
+      if (nextCell === '"') {
+        return '"'; // Indica que pisou na grama
+      }
+    }
+    return null; // Não se moveu ou pisou em tile normal
+  }
+
+  addPokemonToTeam(pokemon: Pokemon): boolean {
+    if (this.team.length < this.maxTeamSize) {
+      this.team.push(pokemon);
+      return true;
+    }
+    console.log('Sua equipe está cheia!');
+    return false;
+  }
+
+  getActivePokemon(): Pokemon | undefined {
+    return this.team.find(p => p.currentHp > 0); // Retorna o primeiro Pokémon vivo
+  }
+
+  switchPokemon(index: number): boolean {
+    if (index >= 0 && index < this.team.length && this.team[index].currentHp > 0) {
+      // Coloca o Pokémon escolhido na primeira posição (ativo)
+      const chosenPokemon = this.team.splice(index, 1)[0];
+      this.team.unshift(chosenPokemon);
+      return true;
+    }
+    return false;
+  }
+
+  // Para salvar e carregar do DB
+  getTeamSaveData(): PokemonData[] {
+      return this.team.map(p => ({
+          id: p.id, // ID para buscar o basePokemon no DB
+          level: p.stats.level,
+          xp: p.stats.xp,
+          currentHp: p.currentHp,
+          // outros stats que podem mudar e precisam ser salvos,
+          // ou recalcular com base no nível ao carregar
+      }));
+  }
+
+  loadTeamFromData(teamData: PokemonData[], allPokemons: Pokemon[]): void {
+      this.team = teamData.map(data => {
+          const basePokemon = allPokemons.find(p => p.id === data.id);
+          if (basePokemon) {
+              const instance = Pokemon.createInstanceWithLevel(basePokemon, data.level);
+              instance.stats.xp = data.xp;
+              instance.currentHp = data.currentHp > instance.stats.maxHp ? instance.stats.maxHp : data.currentHp;
+              return instance;
+          }
+          return null;
+      }).filter(p => p !== null) as Pokemon[];
+  }
+}
+
+//Pokemon.ts
+
+import { PokemonType } from '../enum/PokemonType';
+
+export interface PokemonStats {
+  attack: number;
+  defense: number;
+  hp: number; // Nos seus stats base, isso pode ser o HP base para o nível 1
+  maxHp: number;
+  speed: number;
+  type: PokemonType;
+  level: number;
+  xp: number;
+  xpToNextLevel: number;
+}
+
+// Função auxiliar para calcular a experiência total necessária para um determinado nível
+// na curva Médio-Rápido, conforme interpretação da tabela da Bulbapedia.
+function getTotalXpForMediumFast(level: number): number {
+  if (level <= 1) return 0; // XP total para alcançar o nível 1 é 0 (começa no nível 1 com 0 XP total)
+  return Math.pow(level, 3); // XP total para alcançar níveis > 1 é L^3
+}
+
+export default class Pokemon {
+  public id: number;
+  public name: string;
+  public asciiArt: string;
+  public stats: PokemonStats;
+  public currentHp: number;
+
+  constructor(id: number, name: string, asciiArt: string, stats: PokemonStats) {
+    this.id = id;
+    this.name = name;
+    this.asciiArt = asciiArt;
+    this.stats = { ...stats }; // Clonar para evitar modificação do objeto de stats original
+
+    // Se 'stats.hp' recebido é o HP base para o nível 1, e 'stats.maxHp' não está ajustado para o nível atual:
+    // A lógica de cálculo de maxHp e hp inicial baseado no nível deve ocorrer aqui ou em createInstanceWithLevel.
+    // Por agora, assume-se que 'stats.maxHp' e 'stats.hp' (para currentHp) já estão corretos para 'stats.level'.
+    this.currentHp = this.stats.hp; // Idealmente, this.currentHp = this.stats.maxHp se o Pokémon começa com vida cheia.
+
+    // Define xpToNextLevel de acordo com a curva Médio-Rápido para o nível atual
+    this.stats.xpToNextLevel = getTotalXpForMediumFast(this.stats.level + 1) - getTotalXpForMediumFast(this.stats.level);
+    
+    // Garante que o XP atual não exceda o necessário para o próximo nível (importante se stats.xp for > 0 na criação)
+    if (this.stats.xp >= this.stats.xpToNextLevel && this.stats.xpToNextLevel > 0) {
+        // Se o XP passado já for suficiente para subir de nível, chama levelUp.
+        // Isso pode acontecer se um Pokémon for criado com XP acumulado.
+        // No entanto, geralmente, um Pokémon recém-criado ou que acabou de subir de nível teria this.stats.xp = 0.
+        // Para evitar chamadas recursivas no construtor, essa lógica é mais segura em gainXp.
+        // Se for uma criação inicial, o XP geralmente deve ser 0.
+    }
+  }
+
+  public takeDamage(damage: number): void {
+    this.currentHp -= damage;
+    if (this.currentHp < 0) {
+      this.currentHp = 0;
+    }
+  }
+
+  public heal(amount: number): void {
+    this.currentHp += amount;
+    if (this.currentHp > this.stats.maxHp) {
+      this.currentHp = this.stats.maxHp;
+    }
+  }
+
+  public gainXp(amount: number): boolean { // Retorna true se subiu de nível pelo menos uma vez
+    if (amount <= 0) return false; // Não processa XP negativo ou zero
+
+    this.stats.xp += amount;
+    let leveledUpThisCall = false;
+
+    // Loop para lidar com múltiplos level ups com uma única concessão de XP
+    while (this.stats.xp >= this.stats.xpToNextLevel && this.stats.xpToNextLevel > 0) {
+      // (this.stats.xpToNextLevel > 0 evita loop infinito se xpToNextLevel for 0 ou negativo)
+      this.levelUp();
+      leveledUpThisCall = true;
+    }
+    return leveledUpThisCall;
+  }
+
+  private levelUp(): void {
+    this.stats.level++;
+    // Subtrai o XP necessário para o nível anterior, carregando o excesso para o novo nível
+    this.stats.xp -= this.stats.xpToNextLevel; 
+    
+    // Se o xp restante for negativo (acontece se xpToNextLevel for maior que o xp atual antes do level up, o que não deveria ocorrer com a lógica de while), zera.
+    if (this.stats.xp < 0) this.stats.xp = 0;
+
+    // Atualiza xpToNextLevel para o novo nível usando a curva Médio-Rápido
+    this.stats.xpToNextLevel = getTotalXpForMediumFast(this.stats.level + 1) - getTotalXpForMediumFast(this.stats.level);
+    if (this.stats.xpToNextLevel <= 0 && this.stats.level < 100) { // Nível máximo pode ser 100
+        console.warn(`xpToNextLevel calculado como ${this.stats.xpToNextLevel} para o nível ${this.stats.level}. Verifique a fórmula.`);
+        // Define um fallback para evitar divisão por zero ou loops, se necessário.
+        // Para o nível 100, xpToNextLevel pode ser 0 ou um valor muito alto, indicando que não há mais níveis.
+        if (this.stats.level >= 100) { // Exemplo de nível máximo
+            this.stats.xpToNextLevel = Infinity; // Ou 0, e xp não aumenta mais.
+            this.stats.xp = 0; // Zera o XP no nível máximo.
+        }
+    }
+
+
+    // Aumentar status (exemplo simples - mantenha ou ajuste conforme sua lógica de jogo)
+    // Esta é uma progressão linear simples, você pode querer torná-la dependente do Pokémon base.
+    this.stats.maxHp += 5;
+    this.stats.attack += 2;
+    this.stats.defense += 2;
+    this.stats.speed += 1;
+    this.currentHp = this.stats.maxHp; // Curar completamente ao subir de nível
+
+    console.log(`${this.name} subiu para o nível ${this.stats.level}!`);
+  }
+
+  // Método para criar uma instância com stats variáveis (nível)
+  public static createInstanceWithLevel(basePokemonDef: { id: number, name: string, asciiArt: string, stats: PokemonStats }, targetLevel: number): Pokemon {
+    // Cria um Pokémon no nível 1 com os stats base e XP inicial correto para a curva.
+    const initialStatsForLevel1: PokemonStats = {
+        ...basePokemonDef.stats, // Copia stats base (tipo, ataque base inicial, defesa base inicial, etc.)
+        level: 1,
+        xp: 0,
+        // Define xpToNextLevel para ir do nível 1 para o 2
+        xpToNextLevel: getTotalXpForMediumFast(1 + 1) - getTotalXpForMediumFast(1) // = 8
+    };
+    // Ajusta maxHp e hp inicial para o nível 1 se basePokemonDef.stats.hp/maxHp forem para um nível diferente ou forem apenas bases
+    // Exemplo: initialStatsForLevel1.maxHp = basePokemonDef.stats.hp; (se .hp for o base HP)
+    // initialStatsForLevel1.hp = initialStatsForLevel1.maxHp;
+
+
+    const newPokemonInstance = new Pokemon(basePokemonDef.id, basePokemonDef.name, basePokemonDef.asciiArt, initialStatsForLevel1);
+
+    // Simular subidas de nível para ajustar os stats até o 'targetLevel' desejado
+    if (targetLevel > 1) {
+      // Precisamos simular o ganho de XP para cada nível até atingir o targetLevel.
+      // A forma mais robusta é setar o nível e recalcular os stats e xpToNextLevel,
+      // ou chamar levelUp() repetidamente.
+      for (let currentSimulatedLevel = 1; currentSimulatedLevel < targetLevel; currentSimulatedLevel++) {
+        // Aumentos de status que ocorreriam em levelUp()
+        newPokemonInstance.stats.maxHp += 5; // Estes devem corresponder aos aumentos em levelUp()
+        newPokemonInstance.stats.attack += 2;
+        newPokemonInstance.stats.defense += 2;
+        newPokemonInstance.stats.speed += 1;
+        
+        newPokemonInstance.stats.level++; // Incrementa o nível manualmente na simulação
+      }
+      // Após o loop, o nível está correto. Ajusta xpToNextLevel para o targetLevel final.
+      newPokemonInstance.stats.xpToNextLevel = getTotalXpForMediumFast(newPokemonInstance.stats.level + 1) - getTotalXpForMediumFast(newPokemonInstance.stats.level);
+      newPokemonInstance.stats.xp = 0; // XP é zerado para o novo nível
+    }
+    
+    newPokemonInstance.currentHp = newPokemonInstance.stats.maxHp; // Garante HP cheio no final
+
+    return newPokemonInstance;
+  }
+}
+
+//BattleScreen.ts
+
+import Screen from "./Screen";
+import Pokemon from "../model/Pokemon";
+import { PokemonType } from "../enum/PokemonType";
+import PlayerModel from "../model/Player";
+import { BattleAction } from "../enum/BattleAction";
+import { ItemType, POTION, POKEBALL } from "../model/Item";
+import BattleController from "../controller/BattleController";
+import kleur from "kleur";
+
+export default class BattleScreen extends Screen {
+  private playerPokemon: Pokemon; 
+  private wildPokemon: Pokemon;
+  private player: PlayerModel;
+  private battleController: BattleController;
+
+  private options: string[] = [
+    kleur.red("Atacar"),
+    kleur.blue("Itens"),
+    kleur.green("Pokémon"),
+    kleur.yellow("Fugir"),
+  ];
+  private selectedAction = 0;
+  public message: string = "";
+  private selectingItem: boolean = false;
+  private selectingPokemon: boolean = false;
+  private itemOptions: string[] = [];
+  private pokemonOptions: string[] = [];
+  private selectedItemIndex = 0;
+  private selectedPokemonIndex = 0;
+
+  constructor(
+    player: PlayerModel,
+    wildPokemon: Pokemon,
+    battleController: BattleController
+  ) {
+    super();
+    this.player = player;
+    const activePokemon = player.getActivePokemon();
+    if (!activePokemon) {
+      console.error(
+        "BattleScreen construída sem Pokémon ativo para o jogador!"
+      );
+
+      this.playerPokemon =
+        player.team[0] ||
+        new Pokemon(0, "ErrorMon", "", {
+          attack: 0,
+          defense: 0,
+          hp: 0,
+          maxHp: 0,
+          speed: 0,
+          type: PokemonType.NORMAL,
+          level: 1,
+          xp: 0,
+          xpToNextLevel: 0,
+        });
+    } else {
+      this.playerPokemon = activePokemon;
+    }
+    this.wildPokemon = wildPokemon;
+    this.battleController = battleController;
+    this.message = `Um ${wildPokemon.name} selvagem apareceu!`;
+  }
+
+  private updateItemOptions(): void {
+    this.itemOptions = [];
+    this.player.inventory.getItems().forEach((quantity, itemType) => {
+      this.itemOptions.push(`${itemType}: ${quantity}`);
+    });
+    if (this.itemOptions.length === 0)
+      this.itemOptions.push(kleur.italic("Nenhum item"));
+    this.itemOptions.push(kleur.yellow("Voltar"));
+    this.selectedItemIndex = 0;
+  }
+
+  private updatePokemonOptions(): void {
+    this.pokemonOptions = this.player.team.map((p, index) => {
+      const activeMark =
+        p === this.playerPokemon && p.currentHp > 0
+          ? kleur.cyan("(Ativo) ")
+          : "";
+      const faintedMark = p.currentHp === 0 ? kleur.red("(Caído) ") : "";
+      return `${activeMark}${faintedMark}${p.name} (HP: ${p.currentHp}/${p.stats.maxHp}, Nv: ${p.stats.level})`;
+    });
+    this.pokemonOptions.push(kleur.yellow("Voltar"));
+    this.selectedPokemonIndex = 0; // Reseta o índice de seleção
+  }
+
+  public render(): void {
+    console.clear();
+    console.log(kleur.bold().magenta("=== BATALHA ===\n"));
+
+    // Wild Pokemon
+    console.log(
+      kleur.yellow(
+        ` Adversário: ${this.wildPokemon.name} (Nv. ${this.wildPokemon.stats.level})`
+      )
+    );
+    console.log(
+      ` HP: ${this.wildPokemon.currentHp} / ${this.wildPokemon.stats.maxHp}`
+    );
+    console.log(this.wildPokemon.asciiArt);
+    console.log("\n--------------------\n");
+
+
+    if (this.playerPokemon && this.playerPokemon.name) {
+      // Verifica se playerPokemon e seu nome existem
+      console.log(
+        kleur.cyan(
+          ` Seu Pokémon: ${this.playerPokemon.name} (Nv. ${this.playerPokemon.stats.level})`
+        )
+      );
+      console.log(
+        ` HP: ${this.playerPokemon.currentHp} / ${this.playerPokemon.stats.maxHp} | XP: ${this.playerPokemon.stats.xp}/${this.playerPokemon.stats.xpToNextLevel}`
+      );
+      if (this.playerPokemon.asciiArt) {
+        console.log(this.playerPokemon.asciiArt);
+      } else {
+        console.log(kleur.italic("[Sem Arte ASCII para este Pokémon]"));
+      }
+    } else {
+      console.log(kleur.red("Seu Pokémon não está disponível para exibição."));
+    }
+
+    if (this.message) {
+      console.log(`\n${kleur.bgWhite().black(this.message)}\n`);
+    }
+
+    if (this.selectingItem) {
+      console.log(kleur.blue("\n--- Usar Item ---"));
+      this.itemOptions.forEach((opt, i) => {
+        console.log(
+          (i === this.selectedItemIndex ? kleur.cyan("› ") : "  ") + opt
+        );
+      });
+    } else if (this.selectingPokemon) {
+      console.log(kleur.green("\n--- Trocar Pokémon ---"));
+      this.pokemonOptions.forEach((opt, i) => {
+
+        console.log(
+          (i === this.selectedPokemonIndex ? kleur.cyan("› ") : "  ") + opt
+        );
+      });
+    } else {
+      console.log("\nO que fazer?");
+      this.options.forEach((opt, i) => {
+        console.log(
+          (i === this.selectedAction ? kleur.cyan("› ") : "  ") + opt
+        );
+      });
+    }
+  }
+
+  public handleInput(key: string): Screen | null {
+    this.message = ""; // Limpa a mensagem a cada input
+
+    if (this.selectingItem) {
+      if (key === "up" && this.selectedItemIndex > 0) this.selectedItemIndex--;
+      else if (
+        key === "down" &&
+        this.selectedItemIndex < this.itemOptions.length - 1
+      )
+        this.selectedItemIndex++;
+      else if (key === "return") {
+        const selectedItemText = this.itemOptions[this.selectedItemIndex];
+        if (
+          selectedItemText === kleur.yellow("Voltar") ||
+          selectedItemText === kleur.italic("Nenhum item")
+        ) {
+          this.selectingItem = false;
+        } else {
+          const itemTypeStr = selectedItemText.split(":")[0] as ItemType;
+          this.battleController.handlePlayerAction(
+            BattleAction.ITEM,
+            itemTypeStr
+          );
+          this.selectingItem = false;
+        }
+      } else if (key === "escape" || key === "backspace") {
+        this.selectingItem = false;
+      }
+    } else if (this.selectingPokemon) {
+      if (key === "up" && this.selectedPokemonIndex > 0)
+        this.selectedPokemonIndex--;
+      else if (
+        key === "down" &&
+        this.selectedPokemonIndex < this.pokemonOptions.length - 1
+      )
+        this.selectedPokemonIndex++;
+      else if (key === "return") {
+        if (
+          this.pokemonOptions[this.selectedPokemonIndex] ===
+          kleur.yellow("Voltar")
+        ) {
+          this.selectingPokemon = false;
+        } else {
+          const targetPokemon = this.player.team[this.selectedPokemonIndex];
+          // Verifica se o Pokémon alvo é diferente do atual E está vivo
+          if (
+            targetPokemon !== this.playerPokemon &&
+            targetPokemon.currentHp > 0
+          ) {
+            this.battleController.handlePlayerAction(
+              BattleAction.POKEMON,
+              this.selectedPokemonIndex
+            );
+            // this.playerPokemon atualizado por updateBattleState via BattleController
+          } else if (targetPokemon.currentHp === 0) {
+            this.message = "Este Pokémon está caído e não pode lutar!";
+          } else {
+            // Mesmo Pokémon
+            this.message = "Este Pokémon já está em batalha!";
+          }
+          this.selectingPokemon = false;
+        }
+      } else if (key === "escape" || key === "backspace") {
+        this.selectingPokemon = false;
+      }
+    } else {
+      // Menu principal da batalha
+      if (key === "up" && this.selectedAction > 0) this.selectedAction--;
+      else if (key === "down" && this.selectedAction < this.options.length - 1)
+        this.selectedAction++;
+      else if (key === "return") {
+        const action = this.selectedAction;
+        if (action === BattleAction.ATTACK) {
+          this.battleController.handlePlayerAction(BattleAction.ATTACK);
+        } else if (action === BattleAction.ITEM) {
+          this.updateItemOptions();
+          if (
+            this.itemOptions.length > 1 ||
+            (this.itemOptions.length === 1 &&
+              this.itemOptions[0] !== kleur.italic("Nenhum item"))
+          ) {
+            // Verifica se há itens além de "Voltar"
+            this.selectingItem = true;
+          } else {
+            this.message = "Nenhum item no inventário!";
+          }
+        } else if (action === BattleAction.POKEMON) {
+          if (this.player.team.length > 0) {
+            this.updatePokemonOptions();
+            this.selectingPokemon = true;
+          } else {
+            this.message = "Você não tem Pokémon!";
+          }
+        } else if (action === BattleAction.FLEE) {
+          this.battleController.handlePlayerAction(BattleAction.FLEE);
+        }
+      }
+    }
+    return this;
+  }
+
+  public updateBattleState(
+    playerPokemon: Pokemon,
+    wildPokemon: Pokemon,
+    message: string
+  ): void {
+    this.playerPokemon = playerPokemon;
+    this.wildPokemon = wildPokemon;
+    this.message = message;
+  }
+}
+
+
+// ContinueScreen.ts
+
+import Screen from './Screen';
+import GameController from '../controller/GameController';
+import * as readline from 'readline';
+
+export default class ContinueScreen extends Screen {
+  public controller = new GameController('../assets/map/mapa1.txt', './db.json');
+
+  public onEnter(): void {
+    this.controller.startContinue();
+    this.bindInput();
+    this.render();
+  }
+
+  public render(): void {
+    this.controller.render();
+  }
+
+  public handleInput(cmd: string): Screen | null {
+    this.controller.handleInput(cmd);
+    return this;
+  }
+
+  private bindInput(): void {
+    process.stdin.removeAllListeners('keypress');
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    process.stdin.on('keypress', (_str, key) => {
+      if (key.ctrl && key.name === 'c') {
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.exit();
+      }
+      this.controller.handleInput(key.name as string);
+      this.render(); // Controller cuida do render interno
+    });
+  }
+}
+
+//GameScreen.ts
+
+import Screen from './Screen';
+import GameController from '../controller/GameController';
+import * as readline from 'readline'; // Para o bindInput
+
+export default class GameScreen extends Screen {
+  // GameController agora é público para ser acessado pelo index.ts para input
+  public controller = new GameController('../assets/map/mapa1.txt', './db.json');
+
+  public onEnter(): void {
+    this.controller.startNew();
+    // O GameController agora gerencia seu próprio estado de tela (mapa, inventário, batalha)
+    // O input é vinculado uma vez quando esta tela é inserida.
+    this.bindInput();
+    this.render(); // Render inicial
+  }
+
+  public render(): void {
+    this.controller.render();
+  }
+
+  public handleInput(cmd: string): Screen | null {
+    this.controller.handleInput(cmd);
+    // O GameController agora decide se a tela muda (para batalha, inventário, ou se a batalha termina)
+    // Se o controller definir que uma nova "Screen" principal deve ser mostrada (ex: voltar ao menu),
+    // ele deveria ter um mecanismo para sinalizar isso, mas por agora, GameScreen sempre retorna 'this'
+    // ou null se o controller indicar que a tela deve ser fechada (não é o caso aqui geralmente).
+    return this; // Permanece no "jogo" (que pode ser mapa, inventário ou batalha)
+  }
+
+  // Método para vincular o input diretamente ao GameController
+  private bindInput(): void {
+    // Remove listeners antigos para evitar duplicação se onEnter for chamado múltiplas vezes
+    process.stdin.removeAllListeners('keypress');
+
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+    process.stdin.on('keypress', (_str, key) => {
+      if (key.ctrl && key.name === 'c') {
+        // Restaurar o modo do terminal antes de sair
+        if (process.stdin.isTTY) process.stdin.setRawMode(false);
+        process.exit();
+      }
+      // Delega o input diretamente para o GameController
+      this.controller.handleInput(key.name as string);
+      this.render(); // O controller já renderiza internamente, mas para garantir a atualização da tela principal.
+                     // Idealmente, o controller renderizaria ou pediria à tela atual para renderizar.
+    });
+  }
+}
+
+//GameView.ts
+
+import * as readline from 'readline';
+import kleur from 'kleur';
+import Map from '../model/Map';
+import Player from '../model/Player';
+
+export default class GameView {
+  constructor(private map: Map, private player: Player) {}
+
+  render(): void {
+    console.clear();
+
+    const termWidth = process.stdout.columns || this.map.width;
+    const termHeight = (process.stdout.rows || this.map.height) - 1;
+    const px = this.player.x;
+    const py = this.player.y;
+
+
+    const halfW = Math.floor(termWidth / 2);
+    const halfH = Math.floor(termHeight / 2);
+
+    let startX = this.player.x - halfW;
+    let startY = this.player.y - halfH;
+
+    startX = Math.max(0, Math.min(startX, this.map.width - termWidth));
+    startY = Math.max(0, Math.min(startY, this.map.height - termHeight));
+
+    for (let y = startY; y < startY + termHeight; y++) {
+      let line = '';
+      for (let x = startX; x < startX + termWidth; x++) {
+        const cell = this.map.getCell(x, y);
+        if (x === this.player.x && y === this.player.y) {
+          line += kleur.green('@');
+        } else if (cell === '"') {
+          line += kleur.green('"');
+        } else {
+          line += cell;
+        }
+      }
+      console.log(line);
+    }
+  }
+
+  bindInput(onCommand: (cmd: string) => void) {
+    readline.emitKeypressEvents(process.stdin);
+    if (process.stdin.isTTY) process.stdin.setRawMode(true);
+    process.stdin.on('keypress', (_str, key) => {
+      if (key.ctrl && key.name === 'c') process.exit();
+      onCommand(key.name as string);
+    });
+  }
+}
+
+//InventoryScreen.ts
+
+import Screen from './Screen';
+import PlayerModel from '../model/Player';
+import { POKEBALL, POTION, ItemType } from '../model/Item';
+import GameController from '../controller/GameController';
+import kleur from 'kleur';
+
+export default class InventoryScreen extends Screen {
+  private player: PlayerModel;
+  private gameController: GameController;
+  private options: string[] = [];
+  private selected = 0;
+  private message: string | null = null;
+
+  constructor(player: PlayerModel, gameController: GameController) {
+    super();
+    this.player = player;
+    this.gameController = gameController;
+    this.updateOptions(); // Mantém a lógica dos itens
+  }
+
+  private updateOptions(): void {
+    this.options = [];
+    this.player.inventory.getItems().forEach((quantity, itemType) => {
+      this.options.push(`${itemType}: ${quantity}`);
+    });
+    if (this.options.length === 0) {
+      this.options.push(kleur.italic('Inventário vazio'));
+    }
+    this.options.push(kleur.yellow('Voltar'));
+    this.selected = Math.min(this.selected, this.options.length - 1);
+  }
+
+  public render(): void {
+    console.clear();
+    console.log(kleur.bold().blue('=== Inventário ===\n'));
+
+    // Seção de Itens (como já existe)
+    console.log(kleur.bold().magenta('-- Itens --'));
+    this.options.forEach((opt, i) => {
+      // Mantém a lógica de seleção para itens, se aplicável,
+      // ou simplifica se a seleção for apenas para itens e não para Pokémon nesta tela.
+      // Por enquanto, a seleção ainda é baseada nas opções de itens e "Voltar".
+      console.log(
+        (i === this.selected ? kleur.cyan('› ') : '  ') + opt
+      );
+    });
+
+    // Nova Seção para a Equipe Pokémon
+    console.log(kleur.bold().green('\n-- Equipe Pokémon --'));
+    if (this.player.team.length > 0) {
+      this.player.team.forEach(pokemon => {
+        const hpDisplay = `${pokemon.currentHp}/${pokemon.stats.maxHp}`;
+        const levelDisplay = `Nv: ${pokemon.stats.level}`;
+        // Exemplo de como exibir cada Pokémon. Adapte conforme necessário.
+        console.log(`  ${pokemon.name} (${levelDisplay}) - HP: ${hpDisplay}`);
+      });
+    } else {
+      console.log(kleur.italic('  Nenhum Pokémon na equipe.'));
+    }
+
+    if (this.message) {
+        console.log(`\n${this.message}`);
+        this.message = null;
+    }
+
+    // Adiciona uma linha em branco antes de qualquer mensagem ou para espaçamento
+    console.log('\n'); 
+    // Se a mensagem de "Voltar" não estiver em this.options, você pode adicioná-la manualmente aqui
+    // ou ajustar a lógica de `updateOptions` e `handleInput` se a tela de inventário
+    // ganhar mais interações (como selecionar um Pokémon para ver detalhes ou usar um item nele diretamente daqui).
+    // Por enquanto, a opção "Voltar" já é tratada pelo array `this.options`.
+  }
+
+  public handleInput(cmd: string): Screen | null {
+    // A lógica de input atual lida com a seleção de itens e a opção "Voltar".
+    // Se a intenção é apenas exibir a equipe, esta parte pode não precisar de grandes alterações.
+    // Se for necessário interagir com os Pokémon listados (ex: usar item diretamente neles a partir daqui),
+    // este método precisará ser expandido.
+
+    if (cmd === 'up' && this.selected > 0) {
+      this.selected--;
+    } else if (cmd === 'down' && this.selected < this.options.length - 1) {
+      this.selected++;
+    } else if (cmd === 'return') {
+      const selectedOptionText = this.options[this.selected];
+      if (selectedOptionText === kleur.yellow('Voltar') || selectedOptionText === kleur.italic('Inventário vazio')) {
+        this.gameController.resumeGame();
+        return null;
+      } else {
+        const itemTypeStr = selectedOptionText.split(':')[0];
+        const itemType = itemTypeStr as ItemType;
+
+        if (itemType === ItemType.POTION) {
+          const activePokemon = this.player.getActivePokemon();
+          if (activePokemon && activePokemon.currentHp < activePokemon.stats.maxHp) {
+            if (this.player.inventory.removeItem(ItemType.POTION)) {
+              POTION.action?.(activePokemon);
+              this.message = `${ItemType.POTION} usado em ${activePokemon.name}.`;
+              this.gameController.getDatabase().savePlayerInventory(this.player.inventory.toSaveData());
+            }
+          } else if (activePokemon) {
+            this.message = `${activePokemon.name} já está com HP máximo ou não há Pokémon ativo.`;
+          } else {
+            this.message = 'Nenhum Pokémon ativo para usar a poção.';
+          }
+          this.updateOptions();
+        } else {
+            this.message = `Não é possível usar ${itemType} aqui.`;
+        }
+      }
+    } else if (cmd === 'i' || cmd === 'esc' || cmd === 'escape') {
+        this.gameController.resumeGame();
+        return null;
+    }
+    return this; // Permanece nesta tela
+  }
+}
+
+//MainScreen.ts
+
+import Screen from './Screen';
+import GameScreen from './GameScreen';
+import ContinueScreen from './ContinueScreen';
+import kleur from 'kleur';
+
+export default class MainMenuScreen extends Screen {
+  private options = [kleur.yellow('Continue'), kleur.yellow('New Game'), kleur.yellow('Exit')];
+  private selected = 0;
+
+  public render(): void {
+    console.clear();
+    console.log(kleur.yellow('=== Monters RPG ===\n'));
+    this.options.forEach((opt, i) => {
+      console.log(
+        (i === this.selected ? '› ' : '  ') + opt
+      );
+    });
+  }
+
+  public handleInput(cmd: string): Screen | null {
+    if (cmd === 'up' && this.selected > 0) this.selected--;
+    if (cmd === 'down' && this.selected < this.options.length - 1) this.selected++;
+    if (cmd === 'return') {
+      switch (this.options[this.selected]) {
+        case kleur.yellow('Continue'):  return new ContinueScreen();
+        case kleur.yellow('New Game'):  return new GameScreen();      // inicia jogo do zero
+        case kleur.yellow('Exit'):      process.exit(0);
+      }
+    }
+    return this;  // permanece nesta tela
+  }
+}
+
+
+//Screen.ts
+
+export default class Screen {
+    public render(): void {
+        console.log("O método render() não foi sobrescrito na classe derivada.");
+    }
+
+    public handleInput(cmd: string): Screen | null {
+        console.log(`O método handleInput() não foi sobrescrito para tratar o comando: ${cmd}`);
+        return this;
+    }
+
+    public onEnter?(): void;
+}
+
+//index.ts
+
+import * as readline from 'readline';
+import Screen from './view/Screen';
+import MainMenuScreen from './view/MainScreen';
+import GameScreen from './view/GameScreen'; // Importar para possível acesso direto
+import ContinueScreen from './view/ContinueScreen'; // Importar
+
+let currentScreen: Screen = new MainMenuScreen();
+currentScreen.onEnter?.();
+currentScreen.render();
+
+// O input principal agora é tratado pelas telas ativas (GameScreen, ContinueScreen)
+// quando elas estão no controle, pois elas vinculam o GameController.
+// Este listener é para o MainMenuScreen.
+const mainMenuKeypressListener = (_str: string | undefined, key: { name: string, ctrl?: boolean }) => {
+  if (key.ctrl && key.name === 'c') {
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.exit();
+  }
+
+  // Só processa input se a tela atual for o MainMenu ou uma que não tem seu próprio listener de keypress dedicado
+  if (currentScreen instanceof MainMenuScreen) {
+      const next = currentScreen.handleInput(key.name!);
+      if (next && next !== currentScreen) {
+        currentScreen = next;
+        currentScreen.onEnter?.(); // Isso chamará o bindInput de GameScreen/ContinueScreen
+                                // que substituirá este listener.
+      }
+  }
+  // Se a tela atual não for MainMenu, seu próprio handler (bindInput) já está ativo.
+  // A renderização também é responsabilidade da tela ativa.
+  currentScreen.render();
+};
+
+
+readline.emitKeypressEvents(process.stdin);
+if (process.stdin.isTTY) process.stdin.setRawMode(true);
+process.stdin.on('keypress', mainMenuKeypressListener);
+
+// Lógica para restaurar o listener do menu principal se voltarmos a ele
+// (não totalmente implementado aqui, pois a navegação de volta ao menu não está completa)

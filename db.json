@@ -1,0 +1,20 @@
+{
+  "playerPosition": {
+    "x": 35,
+    "y": 20
+  },
+  "playerInventory": {
+    "Pokebola": 7,
+    "Poção de Cura": 4
+  },
+  "playerTeam": [
+    {
+      "id": 1,
+      "level": 6,
+      "xp": 25,
+      "currentHp": 60
+    }
+  ],
+  "x": 42,
+  "y": 11
+}
