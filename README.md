@@ -18,19 +18,6 @@ Bem-vindo ao Monsters RPG! Um jogo de aventura baseado em texto onde você explo
 * **Persistência de Dados**: O progresso do jogo (posição do jogador, inventário, equipe) é salvo em um arquivo `db.json`, permitindo continuar o jogo de onde parou.
 * **Objetos Interativos**: Encontre objetos no mapa (representados por `o`) que, ao interagir (tecla 'e' ou 'Enter'), podem dar itens ao jogador e depois desaparecem.
 
-## Conceitos de POO e Design Aplicados
-
-* **Modelo MVC (Model-View-Controller)**:
-    * **Model**: Classes como `Player`, `Pokemon`, `Map`, `Inventory`, `Item` e `Database` representam os dados e a lógica de negócios do jogo.
-    * **View**: Classes como `GameView`, `BattleScreen`, `InventoryScreen`, `MainScreen` são responsáveis por apresentar as informações ao usuário.
-    * **Controller**: Classes como `GameController` e `BattleController` gerenciam a entrada do usuário, atualizam o modelo e selecionam a visualização apropriada.
-* **Classes e Objetos**: O jogo é construído em torno de classes que definem os diferentes componentes (Jogador, Monstro, Mapa, etc.) e seus objetos instanciados.
-* **Encapsulamento**: Dados internos das classes são protegidos (privados) e acessados/modificados através de métodos públicos.
-* **Herança e Polimorfismo**: A classe `Screen` atua como uma classe base para todas as telas do jogo (`MainMenuScreen`, `GameScreen`, `BattleScreen`, etc.), permitindo que o `GameController` trate diferentes telas de forma polimórfica através de uma interface comum (`render`, `handleInput`).
-* **Abstração**: O jogador interage com o jogo através de comandos simples, e a complexidade interna da lógica de jogo, batalhas, e gerenciamento de dados é abstraída.
-* **Enumerações**: `PokemonType`, `BattleAction`, e `ItemType` são usados para criar conjuntos de constantes nomeadas, melhorando a legibilidade e segurança do código.
-* **Interfaces (e Tipos Estruturais)**: Interfaces como `PokemonDefinition`, `PokemonData`, `BushEncounter`, e `Item` definem contratos para a estrutura de objetos de dados.
-
 ## Como Rodar o Projeto
 
 1.  **Pré-requisitos**:
